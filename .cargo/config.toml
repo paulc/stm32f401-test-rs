@@ -14,3 +14,6 @@ target = "thumbv7em-none-eabihf"    # Cortex-M4F and Cortex-M7F (with FPU)
 
 [profile.release]
 # debug = 2                           # For defmt
+
+[alias]
+gdb = "run -- gdb"

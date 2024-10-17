@@ -8,7 +8,7 @@ use cortex_m_rt::entry;
 use heapless;
 use panic_rtt_target as _;
 use stm32f4xx_hal::{
-    gpio::{Edge, Input, PA0},
+    gpio::{Edge, Input, Output, PA0, PC13},
     otg_fs::{UsbBus, USB},
     pac::{self, interrupt, Interrupt},
     prelude::*,
@@ -19,11 +19,20 @@ use usb_device::prelude::*;
 use usbd_serial::{SerialPort, USB_CLASS_CDC};
 
 // MSG_QUEUE
+#[derive(Debug)]
 enum Message {
     SerialInput(heapless::String<64>),
     ButtonPress(char, u8),
 }
 static MSG_QUEUE: heapless::mpmc::Q4<Message> = heapless::mpmc::Q4::new();
+
+// LED MSG_QUEUE
+enum LedState {
+    On,
+    Off,
+    Flash,
+}
+static LED_QUEUE: heapless::mpmc::Q2<LedState> = heapless::mpmc::Q2::new();
 
 // USB Devices
 type UsbDeviceType = UsbDevice<'static, UsbBus<USB>>;
@@ -34,11 +43,18 @@ static G_USB_SERIAL: Mutex<RefCell<Option<UsbSerialType>>> = Mutex::new(RefCell:
 type Key = PA0<Input>;
 static G_KEY: Mutex<RefCell<Option<Key>>> = Mutex::new(RefCell::new(None));
 
-// Timer
-type Tim = CounterHz<pac::TIM2>;
-static G_TIMER: Mutex<RefCell<Option<Tim>>> = Mutex::new(RefCell::new(None));
+// Timers
+type QueueTimer = CounterHz<pac::TIM2>;
+static G_QUEUE_TIMER: Mutex<RefCell<Option<QueueTimer>>> = Mutex::new(RefCell::new(None));
+type LedTimer = CounterHz<pac::TIM3>;
+static G_LED_TIMER: Mutex<RefCell<Option<LedTimer>>> = Mutex::new(RefCell::new(None));
 
 const TICK_HZ: u32 = 50;
+const LED_HZ: u32 = 10;
+
+// LED
+type Led = PC13<Output>;
+static G_LED: Mutex<RefCell<Option<Led>>> = Mutex::new(RefCell::new(None));
 
 #[entry]
 fn main() -> ! {
@@ -68,6 +84,7 @@ fn main() -> ! {
     let mut exti = dp.EXTI;
 
     let gpioa = dp.GPIOA.split();
+    let gpioc = dp.GPIOC.split();
 
     // KEY button
     let mut key = gpioa.pa0.into_pull_up_input();
@@ -77,12 +94,18 @@ fn main() -> ! {
     key.trigger_on_edge(&mut exti, Edge::Falling);
     key.enable_interrupt(&mut exti);
 
-    // TIMER
-    let mut timer = Timer::new(dp.TIM2, &clocks).counter_hz();
-    timer.start(TICK_HZ.Hz()).unwrap();
+    // LED
+    let mut led = gpioc.pc13.into_push_pull_output();
+    led.set_high();
 
-    // Generate an interrupt when the timer expires
-    timer.listen(Event::Update);
+    // TIMERs
+    let mut q_timer = Timer::new(dp.TIM2, &clocks).counter_hz();
+    q_timer.start(TICK_HZ.Hz()).unwrap();
+    q_timer.listen(Event::Update); // Generate an interrupt when the timer expires
+
+    let mut led_timer = Timer::new(dp.TIM3, &clocks).counter_hz();
+    led_timer.start(LED_HZ.Hz()).unwrap();
+    led_timer.listen(Event::Update); // Generate an interrupt when the timer expires
 
     // Setup USB
     let usb = USB::new(
@@ -99,8 +122,12 @@ fn main() -> ! {
         // Button
         G_KEY.borrow(cs).replace(Some(key));
 
+        // LED
+        G_LED.borrow(cs).replace(Some(led));
+
         // Timer
-        G_TIMER.borrow(cs).replace(Some(timer));
+        G_QUEUE_TIMER.borrow(cs).replace(Some(q_timer));
+        G_LED_TIMER.borrow(cs).replace(Some(led_timer));
 
         // USB
         if let Some(usb_bus) = USB_BUS.as_ref() {
@@ -125,9 +152,63 @@ fn main() -> ! {
         NVIC::unmask(Interrupt::OTG_FS);
         NVIC::unmask(Interrupt::EXTI0);
         NVIC::unmask(Interrupt::TIM2);
+        NVIC::unmask(Interrupt::TIM3);
     }
 
     loop {}
+}
+
+#[interrupt]
+fn TIM2() {
+    // Handle Message Queue
+    static mut COUNTER: u32 = 0;
+    cortex_m::interrupt::free(|cs| {
+        if let Some(t) = G_QUEUE_TIMER.borrow(cs).borrow_mut().as_mut() {
+            let _ = t.wait();
+        }
+        if let Some(m) = MSG_QUEUE.dequeue() {
+            log::info!("MESSAGE :: {:?}", m);
+            match m {
+                Message::ButtonPress(p, n) => log::info!(">> BUTTON_PRESS: {}{}", p, n),
+                Message::SerialInput(s) => match s.as_str() {
+                    "LED ON" => {
+                        LED_QUEUE.enqueue(LedState::On).ok();
+                    }
+                    "LED OFF" => {
+                        LED_QUEUE.enqueue(LedState::Off).ok();
+                    }
+                    "LED FLASH" => {
+                        LED_QUEUE.enqueue(LedState::Flash).ok();
+                    }
+                    _ => {}
+                },
+            }
+        }
+        *COUNTER += 1;
+        if *COUNTER % TICK_HZ == 0 {
+            log::info!("[TIMER]");
+        }
+    });
+}
+
+#[interrupt]
+fn TIM3() {
+    static mut LED_STATE: LedState = LedState::Off;;
+    cortex_m::interrupt::free(|cs| {
+        if let Some(t) = G_LED_TIMER.borrow(cs).borrow_mut().as_mut() {
+            let _ = t.wait();
+        }
+        if let Some(m) = LED_QUEUE.dequeue() {
+            *LED_STATE = m;
+        }
+        if let Some(led) = G_LED.borrow(cs).borrow_mut().as_mut() {
+            match LED_STATE {
+                LedState::On => led.set_low(),
+                LedState::Off => led.set_high(),
+                LedState::Flash => led.toggle(),
+            }
+        }
+    });
 }
 
 #[interrupt]
@@ -174,8 +255,9 @@ fn OTG_FS() {
                                         // Delete char
                                         // NOTE: This doesnt work with unicode chars > 1 byte
                                         //       (can end up with invalid unicode str)
-                                        BUF.pop();
-                                        serial.write(&[0x08]).ok(); // BS
+                                        if BUF.pop() != None {
+                                            serial.write(&[0x08]).ok(); // BS
+                                        }
                                     }
                                     // Any other char
                                     &c => {
@@ -200,26 +282,6 @@ fn OTG_FS() {
                 }
             }
             _ => log::error!("OTG_FS :: error borrowing (usb_dev,serial)"),
-        }
-    });
-}
-
-#[interrupt]
-fn TIM2() {
-    static mut COUNTER: u32 = 0;
-    cortex_m::interrupt::free(|_cs| {
-        if let Some(t) = G_TIMER.borrow(_cs).borrow_mut().as_mut() {
-            let _ = t.wait();
-        }
-        if let Some(m) = MSG_QUEUE.dequeue() {
-            match m {
-                Message::ButtonPress(p, n) => log::info!(">> BUTTON_PRESS: {}{}", p, n),
-                Message::SerialInput(s) => log::info!(">> SERIAL_INPUT: {}", s),
-            }
-        }
-        *COUNTER += 1;
-        if *COUNTER % TICK_HZ == 0 {
-            log::info!("[TIMER]");
         }
     });
 }
