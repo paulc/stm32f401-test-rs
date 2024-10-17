@@ -68,7 +68,7 @@ fn main() -> ! {
 
     // Syetem preipherals
     let dp = pac::Peripherals::take().unwrap();
-    let _cp = cortex_m::peripheral::Peripherals::take().unwrap();
+    let cp = cortex_m::peripheral::Peripherals::take().unwrap();
 
     // Need 48MHz PLL for USB
     let rcc = dp.RCC.constrain();
@@ -107,6 +107,9 @@ fn main() -> ! {
     led_timer.start(LED_HZ.Hz()).unwrap();
     led_timer.listen(Event::Update); // Generate an interrupt when the timer expires
 
+    // delay using system timer
+    let mut delay = cp.SYST.delay(&clocks);
+
     // Setup USB
     let usb = USB::new(
         (dp.OTG_FS_GLOBAL, dp.OTG_FS_DEVICE, dp.OTG_FS_PWRCLK),
@@ -137,7 +140,7 @@ fn main() -> ! {
                 .device_class(USB_CLASS_CDC)
                 .strings(&[StringDescriptors::default()
                     .manufacturer("NA")
-                    .product("STM32F411 BlackPill")
+                    .product("STM32F401 BlackPill")
                     .serial_number("-blackpill")])
                 .unwrap()
                 .build();
@@ -155,17 +158,22 @@ fn main() -> ! {
         NVIC::unmask(Interrupt::TIM3);
     }
 
-    loop {}
+    loop {
+        // For debugging use delay rather than WFI (supresses RTT)
+        // cortex_m::asm::wfi();
+        delay.delay_ms(1u32);
+    }
 }
 
+// TIM2 interrupt handles Message Queue
 #[interrupt]
 fn TIM2() {
-    // Handle Message Queue
     static mut COUNTER: u32 = 0;
     cortex_m::interrupt::free(|cs| {
         if let Some(t) = G_QUEUE_TIMER.borrow(cs).borrow_mut().as_mut() {
             let _ = t.wait();
         }
+        // Handle messages
         if let Some(m) = MSG_QUEUE.dequeue() {
             log::info!("MESSAGE :: {:?}", m);
             match m {
@@ -191,6 +199,7 @@ fn TIM2() {
     });
 }
 
+// TIM3 interrupt handles LED
 #[interrupt]
 fn TIM3() {
     static mut LED_STATE: LedState = LedState::Off;;
@@ -198,6 +207,7 @@ fn TIM3() {
         if let Some(t) = G_LED_TIMER.borrow(cs).borrow_mut().as_mut() {
             let _ = t.wait();
         }
+        // Handle messages
         if let Some(m) = LED_QUEUE.dequeue() {
             *LED_STATE = m;
         }
@@ -211,6 +221,7 @@ fn TIM3() {
     });
 }
 
+// EXTI0 interrupt handles button press
 #[interrupt]
 fn EXTI0() {
     cortex_m::interrupt::free(|_cs| {
@@ -229,6 +240,7 @@ fn send_buf_msg(buf: &heapless::Vec<u8, 64>) {
     }
 }
 
+// OTG_FS interrupt handles USB events
 #[interrupt]
 fn OTG_FS() {
     static mut BUF: heapless::Vec<u8, 64> = heapless::Vec::new();
@@ -240,6 +252,7 @@ fn OTG_FS() {
                 if usb_dev.poll(&mut [serial]) {
                     let mut buf = [0u8; 64];
                     match serial.read(&mut buf) {
+                        // Handle USB input - assemble into line and send to MSG_QUEUE
                         Ok(n) => {
                             for i in 0..n {
                                 match &buf[i] {
@@ -253,7 +266,7 @@ fn OTG_FS() {
                                     // DEL, BS
                                     0x7f | 0x08 => {
                                         // Delete char
-                                        // NOTE: This doesnt work with unicode chars > 1 byte
+                                        // NOTE: This doesnt work correctly with unicode chars > 1 byte
                                         //       (can end up with invalid unicode str)
                                         if BUF.pop() != None {
                                             serial.write(&[0x08]).ok(); // BS
