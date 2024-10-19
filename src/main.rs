@@ -8,10 +8,7 @@ use cortex_m_rt::entry;
 use display_interface_spi::SPIInterface;
 use embedded_graphics::{
     draw_target::DrawTarget,
-    mono_font::{
-        ascii::{FONT_6X12, FONT_8X13, FONT_9X18_BOLD},
-        MonoTextStyle,
-    },
+    mono_font::{ascii::FONT_9X18_BOLD, MonoTextStyle},
     pixelcolor::Rgb565,
     prelude::*,
     primitives::{PrimitiveStyle, Triangle},
