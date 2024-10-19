@@ -5,13 +5,32 @@ use core::cell::RefCell;
 use cortex_m::interrupt::Mutex;
 use cortex_m::peripheral::NVIC;
 use cortex_m_rt::entry;
+use display_interface_spi::SPIInterface;
+use embedded_graphics::{
+    draw_target::DrawTarget,
+    mono_font::{
+        ascii::{FONT_6X12, FONT_8X13, FONT_9X18_BOLD},
+        MonoTextStyle,
+    },
+    pixelcolor::Rgb565,
+    prelude::*,
+    primitives::{PrimitiveStyle, Triangle},
+    text::{Alignment, Text},
+};
+use embedded_hal_bus::spi::ExclusiveDevice;
 use heapless;
+use mipidsi::{
+    models::ILI9341Rgb565,
+    options::{ColorOrder, Orientation, Rotation},
+    Builder,
+};
 use panic_rtt_target as _;
 use stm32f4xx_hal::{
     gpio::{Edge, Input, Output, PA0, PC13},
     otg_fs::{UsbBus, USB},
     pac::{self, interrupt, Interrupt},
     prelude::*,
+    spi::{Mode, NoMiso, Phase, Polarity, Spi},
     timer::{CounterHz, Event, Timer},
 };
 use usb_device::class_prelude::UsbBusAllocator;
@@ -83,8 +102,52 @@ fn main() -> ! {
     let mut syscfg = dp.SYSCFG.constrain();
     let mut exti = dp.EXTI;
 
+    // delay using system timer
+    let mut delay = cp.SYST.delay(&clocks);
+
     let gpioa = dp.GPIOA.split();
+    let gpiob = dp.GPIOB.split();
     let gpioc = dp.GPIOC.split();
+
+    // ILI9341 LCD
+    let lcd_clk = gpiob.pb13.into_alternate();
+    let lcd_miso = NoMiso::new();
+    let lcd_mosi = gpiob.pb15.into_alternate().internal_pull_up(true);
+
+    let mode = Mode {
+        polarity: Polarity::IdleLow,
+        phase: Phase::CaptureOnFirstTransition,
+    };
+
+    let lcd_dc = gpiob.pb0.into_push_pull_output();
+    let lcd_cs = gpiob.pb1.into_push_pull_output();
+    let lcd_reset = gpiob.pb2.into_push_pull_output();
+    let mut lcd_backlight = gpiob.pb12.into_push_pull_output();
+
+    let spi2 = Spi::new(
+        dp.SPI2,
+        (lcd_clk, lcd_miso, lcd_mosi),
+        mode,
+        24.MHz(),
+        &clocks,
+    );
+    let spi_delay = dp.TIM1.delay_us(&clocks);
+    let spi_device = ExclusiveDevice::new(spi2, lcd_cs, spi_delay).unwrap();
+    let display_if = SPIInterface::new(spi_device, lcd_dc);
+
+    log::info!("Configuring Display");
+    let mut display = Builder::new(ILI9341Rgb565, display_if)
+        .reset_pin(lcd_reset)
+        .display_size(240, 320)
+        .orientation(Orientation::new().rotate(Rotation::Deg90).flip_vertical())
+        .color_order(ColorOrder::Bgr)
+        .init(&mut delay)
+        .unwrap();
+
+    lcd_backlight.set_high();
+    display.clear(Rgb565::CYAN).unwrap();
+
+    test_draw(&mut display);
 
     // KEY button
     let mut key = gpioa.pa0.into_pull_up_input();
@@ -106,9 +169,6 @@ fn main() -> ! {
     let mut led_timer = Timer::new(dp.TIM3, &clocks).counter_hz();
     led_timer.start(LED_HZ.Hz()).unwrap();
     led_timer.listen(Event::Update); // Generate an interrupt when the timer expires
-
-    // delay using system timer
-    let mut delay = cp.SYST.delay(&clocks);
 
     // Setup USB
     let usb = USB::new(
@@ -165,6 +225,38 @@ fn main() -> ! {
     }
 }
 
+fn test_draw<D>(display: &mut D)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    Text::with_alignment(
+        "Hello!",
+        Point::new(10, 10),
+        MonoTextStyle::new(&FONT_9X18_BOLD, Rgb565::RED),
+        Alignment::Left,
+    )
+    .draw(display)
+    .ok();
+
+    Text::with_alignment(
+        "There!",
+        Point::new(10, 30),
+        MonoTextStyle::new(&FONT_9X18_BOLD, Rgb565::YELLOW),
+        Alignment::Left,
+    )
+    .draw(display)
+    .ok();
+
+    Triangle::new(
+        Point::new(160, 40),
+        Point::new(80, 160),
+        Point::new(240, 160),
+    )
+    .into_styled(PrimitiveStyle::with_stroke(Rgb565::RED, 4))
+    .draw(display)
+    .ok();
+}
+
 // TIM2 interrupt handles Message Queue
 #[interrupt]
 fn TIM2() {
@@ -177,7 +269,10 @@ fn TIM2() {
         if let Some(m) = MSG_QUEUE.dequeue() {
             log::info!("MESSAGE :: {:?}", m);
             match m {
-                Message::ButtonPress(p, n) => log::info!(">> BUTTON_PRESS: {}{}", p, n),
+                Message::ButtonPress(p, n) => {
+                    log::info!(">> BUTTON_PRESS: {}{}", p, n);
+                    LED_QUEUE.enqueue(LedState::Off).ok();
+                }
                 Message::SerialInput(s) => match s.as_str() {
                     "LED ON" => {
                         LED_QUEUE.enqueue(LedState::On).ok();
