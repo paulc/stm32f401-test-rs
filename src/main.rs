@@ -128,7 +128,7 @@ fn main() -> ! {
         24.MHz(),
         &clocks,
     );
-    let spi_delay = dp.TIM1.delay_us(&clocks);
+    let spi_delay = dp.TIM11.delay_us(&clocks);
     let spi_device = ExclusiveDevice::new(spi2, lcd_cs, spi_delay).unwrap();
     let display_if = SPIInterface::new(spi_device, lcd_dc);
 
@@ -142,7 +142,6 @@ fn main() -> ! {
         .unwrap();
 
     lcd_backlight.set_high();
-    display.clear(Rgb565::CYAN).unwrap();
 
     test_draw(&mut display);
 
@@ -226,6 +225,8 @@ fn test_draw<D>(display: &mut D)
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    display.clear(Rgb565::CYAN).ok();
+
     Text::with_alignment(
         "Hello!",
         Point::new(10, 10),
@@ -252,6 +253,8 @@ where
     .into_styled(PrimitiveStyle::with_stroke(Rgb565::RED, 4))
     .draw(display)
     .ok();
+
+    display.clear(Rgb565::BLACK).ok();
 }
 
 // TIM2 interrupt handles Message Queue
