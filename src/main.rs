@@ -24,20 +24,18 @@ use mipidsi::{
 use panic_rtt_target as _;
 use stm32f4xx_hal::{
     gpio::{Edge, Input, Output, PA0, PC13},
-    otg_fs::{UsbBus, USB},
     pac::{self, Interrupt},
     prelude::*,
     spi::{Mode, NoMiso, Phase, Polarity, Spi},
     timer::{CounterHz, Event, Timer},
 };
-use usb_device::class_prelude::UsbBusAllocator;
-use usb_device::prelude::*;
-use usbd_serial::{SerialPort, USB_CLASS_CDC};
 
 mod exti0;
 mod otg_fs;
 mod tim2;
 mod tim3;
+
+use otg_fs::usb_init;
 
 // MSG_QUEUE
 #[derive(Debug)]
@@ -54,12 +52,6 @@ enum LedState {
     Flash,
 }
 static LED_QUEUE: heapless::mpmc::Q2<LedState> = heapless::mpmc::Q2::new();
-
-// USB Devices
-type UsbDeviceType = UsbDevice<'static, UsbBus<USB>>;
-type UsbSerialType = SerialPort<'static, UsbBus<USB>>;
-static G_USB_DEVICE: Mutex<RefCell<Option<UsbDeviceType>>> = Mutex::new(RefCell::new(None));
-static G_USB_SERIAL: Mutex<RefCell<Option<UsbSerialType>>> = Mutex::new(RefCell::new(None));
 
 type Key = PA0<Input>;
 static G_KEY: Mutex<RefCell<Option<Key>>> = Mutex::new(RefCell::new(None));
@@ -79,10 +71,6 @@ static G_LED: Mutex<RefCell<Option<Led>>> = Mutex::new(RefCell::new(None));
 
 #[entry]
 fn main() -> ! {
-    // Static
-    static mut USB_BUF: [u32; 1024] = [0; 1024];
-    static mut USB_BUS: Option<UsbBusAllocator<UsbBus<USB>>> = None;
-
     // Initialise RTT
     rtt_log::init();
     log::info!("STARTING");
@@ -171,15 +159,13 @@ fn main() -> ! {
     led_timer.start(LED_HZ.Hz()).unwrap();
     led_timer.listen(Event::Update); // Generate an interrupt when the timer expires
 
-    // Setup USB
-    let usb = USB::new(
+    // USB
+    usb_init(
         (dp.OTG_FS_GLOBAL, dp.OTG_FS_DEVICE, dp.OTG_FS_PWRCLK),
         (gpioa.pa11, gpioa.pa12),
         &clocks,
-    );
-
-    // Need usb_bus to have static lifetime due to refs in IRQs
-    USB_BUS.replace(UsbBus::new(usb, &mut USB_BUF[..]));
+    )
+    .unwrap();
 
     // Move devices to static globals to allow access from IRQ
     cortex_m::interrupt::free(|cs| {
@@ -192,23 +178,6 @@ fn main() -> ! {
         // Timer
         G_QUEUE_TIMER.borrow(cs).replace(Some(q_timer));
         G_LED_TIMER.borrow(cs).replace(Some(led_timer));
-
-        // USB
-        if let Some(usb_bus) = USB_BUS.as_ref() {
-            let serial = SerialPort::new(usb_bus);
-
-            let usb_dev = UsbDeviceBuilder::new(usb_bus, UsbVidPid(0x16c0, 0x27dd))
-                .device_class(USB_CLASS_CDC)
-                .strings(&[StringDescriptors::default()
-                    .manufacturer("NA")
-                    .product("STM32F401 BlackPill")
-                    .serial_number("-blackpill")])
-                .unwrap()
-                .build();
-
-            G_USB_SERIAL.borrow(cs).replace(Some(serial));
-            G_USB_DEVICE.borrow(cs).replace(Some(usb_dev));
-        }
     });
 
     // Unmask interrupts
