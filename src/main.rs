@@ -2,26 +2,27 @@
 #![no_main]
 
 use core::cell::RefCell;
+use core::fmt::Write;
 use cortex_m::interrupt::Mutex;
 use cortex_m::peripheral::NVIC;
 use cortex_m_rt::entry;
 use display_interface_spi::SPIInterface;
 use embedded_graphics::{
     draw_target::DrawTarget,
-    mono_font::{ascii::FONT_9X18_BOLD, MonoTextStyle},
+    mono_font::{
+        //ascii::FONT_9X18_BOLD,
+        MonoTextStyle,
+    },
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{PrimitiveStyle, Triangle},
+    // primitives::{PrimitiveStyle, Triangle},
     text::{Alignment, Text},
 };
 use embedded_hal_bus::spi::ExclusiveDevice;
 use heapless;
-use mipidsi::{
-    models::ILI9341Rgb565,
-    options::{ColorOrder, Orientation, Rotation},
-    Builder,
-};
+use ili9341::{DisplaySize240x320, Ili9341, Orientation};
 use panic_rtt_target as _;
+use profont::PROFONT_18_POINT;
 use stm32f4xx_hal::{
     gpio::{Edge, Input, Output, PA0, PC13},
     pac::{self, Interrupt},
@@ -126,13 +127,34 @@ fn main() -> ! {
     let display_if = SPIInterface::new(spi_device, lcd_dc);
 
     log::info!("Configuring Display");
-    let mut display = Builder::new(ILI9341Rgb565, display_if)
-        .reset_pin(lcd_reset)
-        .display_size(240, 320)
-        .orientation(Orientation::new().rotate(Rotation::Deg90).flip_vertical())
-        .color_order(ColorOrder::Bgr)
-        .init(&mut delay)
-        .unwrap();
+
+    // Using Ili9341 driver
+    let mut display = Ili9341::new(
+        display_if,
+        lcd_reset,
+        &mut delay,
+        Orientation::Landscape,
+        DisplaySize240x320,
+    )
+    .unwrap();
+
+    /*
+        // Using mipidsi driver
+
+        use mipidsi::{
+            models::ILI9341Rgb565,
+            options::{ColorOrder, Orientation, Rotation},
+            Builder,
+        };
+
+        let mut display = Builder::new(ILI9341Rgb565, display_if)
+            .reset_pin(lcd_reset)
+            .display_size(240, 320)
+            .orientation(Orientation::new().rotate(Rotation::Deg90).flip_vertical())
+            .color_order(ColorOrder::Bgr)
+            .init(&mut delay)
+            .unwrap();
+    */
 
     lcd_backlight.set_high();
 
@@ -201,6 +223,30 @@ where
 {
     display.clear(Rgb565::CYAN).ok();
 
+    let mut msg = heapless::String::<30>::new();
+    let mut count = 0_u32;
+
+    for _ in 0..5 {
+        for i in 0..10 {
+            msg.clear();
+            write!(msg, "{:4} :: {}", count, "ABCDEFGHIJKLMNOP").ok();
+
+            Text::with_alignment(
+                msg.as_str(),
+                Point::new(10, i * 24),
+                MonoTextStyle::new(&PROFONT_18_POINT, Rgb565::RED),
+                Alignment::Left,
+            )
+            .draw(display)
+            .ok();
+            count += 1;
+        }
+        display.clear(Rgb565::CYAN).ok();
+    }
+
+    display.clear(Rgb565::BLUE).ok();
+
+    /*
     Text::with_alignment(
         "Hello!",
         Point::new(10, 10),
@@ -227,6 +273,7 @@ where
     .into_styled(PrimitiveStyle::with_stroke(Rgb565::RED, 4))
     .draw(display)
     .ok();
+    */
 
-    display.clear(Rgb565::BLACK).ok();
+    // display.clear(Rgb565::BLACK).ok();
 }
